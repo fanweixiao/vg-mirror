@@ -1,4 +1,4 @@
-# codex-proxy
+# vg-mirror (Vivgrid Mirror)
 
 A local LLM API proxy for [Codex](https://github.com/openai/codex).
 
@@ -19,8 +19,8 @@ cargo build --release
 ### 2. Run
 
 ```bash
-./target/release/codex-proxy
-# INFO codex-proxy listening on http://127.0.0.1:33333  →  upstream https://api.vivgrid.com/v1/chat/completions
+./target/release/vg-mirror
+# INFO vg-mirror listening on http://127.0.0.1:33333  →  upstream https://api.vivgrid.com/v1/chat/completions
 ```
 
 ### 3. Point Codex at the proxy
@@ -47,6 +47,16 @@ Then run `codex` as usual and watch the proxy's terminal for logs.
 
 The target triple for Apple Silicon (M1/M2/M3/M4…) is `aarch64-apple-darwin`.
 
+**With make (recommended)**
+
+```bash
+make release   # add target, build, strip, print arch & size
+               # → target/aarch64-apple-darwin/release/vg-mirror
+make install   # also copy it to ~/.local/bin (override with PREFIX=/usr/local/bin)
+```
+
+**By hand**
+
 ```bash
 # 1. Add the target (already installed if you're on an Apple Silicon Mac)
 rustup target add aarch64-apple-darwin
@@ -55,7 +65,7 @@ rustup target add aarch64-apple-darwin
 cargo build --release --target aarch64-apple-darwin
 
 # 3. Check the architecture
-file target/aarch64-apple-darwin/release/codex-proxy
+file target/aarch64-apple-darwin/release/vg-mirror
 # → Mach-O 64-bit executable arm64
 ```
 
@@ -65,12 +75,12 @@ On an Apple Silicon Mac, a plain `cargo build --release` also produces an arm64 
 
 ```bash
 # Strip debug symbols (~8.6 MB → ~6.8 MB)
-strip target/aarch64-apple-darwin/release/codex-proxy
+strip target/aarch64-apple-darwin/release/vg-mirror
 
 # Put it on your PATH
 mkdir -p ~/.local/bin
-cp target/aarch64-apple-darwin/release/codex-proxy ~/.local/bin/
-codex-proxy
+cp target/aarch64-apple-darwin/release/vg-mirror ~/.local/bin/
+vg-mirror
 ```
 
 **Copying the binary to another Mac**
@@ -78,7 +88,7 @@ codex-proxy
 A binary you build yourself is not quarantined. If you send it to another Mac (AirDrop, browser download, chat), Gatekeeper may block it with *"cannot be opened because the developer cannot be verified"*. On that machine, run:
 
 ```bash
-xattr -d com.apple.quarantine ./codex-proxy
+xattr -d com.apple.quarantine ./vg-mirror
 ```
 
 ## Configuration
@@ -90,12 +100,12 @@ All settings are optional environment variables:
 | `LISTEN` | `127.0.0.1:33333` | Address the proxy listens on |
 | `UPSTREAM_URL` | `https://api.vivgrid.com/v1/chat/completions` | Upstream Chat Completions endpoint |
 | `UPSTREAM_API_KEY` | – | Fallback key, used **only** when the incoming request has no `Authorization` header |
-| `RUST_LOG` | `codex_proxy=info` | Log level. `codex_proxy=debug` also logs the full request/response bodies sent to and received from upstream, and each `finish_reason` chunk |
+| `RUST_LOG` | `vg_mirror=info` | Log level. `vg_mirror=debug` also logs the full request/response bodies sent to and received from upstream, and each `finish_reason` chunk |
 
 Example:
 
 ```bash
-RUST_LOG=codex_proxy=debug LISTEN=127.0.0.1:40000 ./target/release/codex-proxy
+RUST_LOG=vg_mirror=debug LISTEN=127.0.0.1:40000 ./target/release/vg-mirror
 ```
 
 ## Endpoints
@@ -141,7 +151,7 @@ INFO #3 ◀ response  [stream, 8.42s, model=gpt-5.6-luna]
 - `⚠ calls without output` / `⚠ outputs without call`: the history has unpaired tool calls. Chat Completions backends often reject this. When it happens, the request line is logged as **WARN**.
 - `items ▸`: every input item counted by type (messages split by role). `[dropped]` = reasoning items. `[⚠ skipped: unknown type]` = item types the proxy can't convert, which are left out of the upstream request (also logged as **WARN**).
 - `sent ▸`: whether the Chat body actually sent upstream still carries any tool traces (`tools` / `tool_choice` / `functions` fields, assistant `tool_calls`, `tool`-role messages).
-- On an upstream error, the full body sent upstream is saved to `$TMPDIR/codex-proxy-req-<id>.json`, and the log prints a `curl` command to replay it.
+- On an upstream error, the full body sent upstream is saved to `$TMPDIR/vg-mirror-req-<id>.json`, and the log prints a `curl` command to replay it.
 
 **Response line (`◀`)**
 - `stop`: the raw upstream `finish_reason` and the Responses status Codex was sent. If upstream also sends `stop_reason`, `native_finish_reason` or `matched_stop`, they are shown on the same line.

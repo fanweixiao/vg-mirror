@@ -1,4 +1,4 @@
-//! codex 用的本地 LLM API 代理：
+//! vg-mirror（Vivgrid Mirror）：codex 用的本地 LLM API 代理：
 //! 对外暴露 OpenAI Responses 接口 `/v1/responses`，转换成 Chat Completions 请求发给上游，
 //! 并在日志里打印每次响应的 stop 值（finish_reason）和 usage。
 
@@ -43,10 +43,10 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    // 日志级别，默认 codex_proxy=info（RUST_LOG）
+    // 日志级别，默认 vg_mirror=info（RUST_LOG）
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("codex_proxy=info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("vg_mirror=info")),
         )
         .with_target(false)
         .init();
@@ -86,7 +86,7 @@ async fn main() {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen).await.expect("bind listen address");
-    info!("codex-proxy listening on http://{listen}  →  upstream {upstream}");
+    info!("vg-mirror listening on http://{listen}  →  upstream {upstream}");
     axum::serve(listener, app).await.expect("server error");
 }
 
@@ -160,7 +160,7 @@ fn dump_sent_request(st: &AppState, headers: &HeaderMap, body: &Value, req_id: u
             sent_headers.push(format!("{to}: {}", String::from_utf8_lossy(v.as_bytes())));
         }
     }
-    let path = std::env::temp_dir().join(format!("codex-proxy-req-{req_id}.json"));
+    let path = std::env::temp_dir().join(format!("vg-mirror-req-{req_id}.json"));
     let saved = match std::fs::write(&path, serde_json::to_vec_pretty(body).unwrap_or_default()) {
         Ok(()) => format!(
             "{}\n             replay: curl -sS {} -H \"Authorization: Bearer $VIVGRID_API_KEY\" -H 'content-type: application/json' -d @{}",
