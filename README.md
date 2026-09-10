@@ -1,0 +1,155 @@
+# codex-proxy
+
+A local LLM API proxy for [Codex](https://github.com/openai/codex).
+
+It exposes the OpenAI **Responses API** (`POST /v1/responses`) on your machine, converts each request to the **Chat Completions API**, and forwards it to `https://api.vivgrid.com/v1/chat/completions`. Replies (streaming and non-streaming) are converted back into Responses format.
+
+For each request, the log shows the upstream **stop value** (`finish_reason`), the **token usage**, and a summary of the **tools** in the request. This makes it easier to debug odd behaviour between Codex and the upstream.
+
+## Quick start
+
+### 1. Build
+
+Requires Rust 1.88+ (edition 2024).
+
+```bash
+cargo build --release
+```
+
+### 2. Run
+
+```bash
+./target/release/codex-proxy
+# INFO codex-proxy listening on http://127.0.0.1:33333  →  upstream https://api.vivgrid.com/v1/chat/completions
+```
+
+### 3. Point Codex at the proxy
+
+Edit `~/.codex/config.toml`:
+
+```toml
+model_provider = "local"
+model = "gpt-5.6-luna"
+
+[model_providers.local]
+name = "Local Proxy"
+base_url = "http://127.0.0.1:33333/v1"
+experimental_bearer_token = "<VIVGRID_API_KEY>"
+```
+
+- `base_url` must match the proxy's listen address, including `/v1`.
+- `experimental_bearer_token` is your vivgrid API key. Codex sends it as `Authorization: Bearer ...`, and the proxy forwards it upstream unchanged.
+- `model` is passed through unchanged, so use any model name vivgrid accepts.
+
+Then run `codex` as usual and watch the proxy's terminal for logs.
+
+## Configuration
+
+All settings are optional environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `LISTEN` | `127.0.0.1:33333` | Address the proxy listens on |
+| `UPSTREAM_URL` | `https://api.vivgrid.com/v1/chat/completions` | Upstream Chat Completions endpoint |
+| `UPSTREAM_API_KEY` | – | Fallback key, used **only** when the incoming request has no `Authorization` header |
+| `RUST_LOG` | `codex_proxy=info` | Log level. `codex_proxy=debug` also logs the full request/response bodies sent to and received from upstream, and each `finish_reason` chunk |
+
+Example:
+
+```bash
+RUST_LOG=codex_proxy=debug LISTEN=127.0.0.1:40000 ./target/release/codex-proxy
+```
+
+## Endpoints
+
+| Method & path | Description |
+|---|---|
+| `POST /v1/responses` (also `/responses`) | Responses API → Chat Completions; supports `stream: true` and `stream: false` |
+| `GET /v1/models` | Passed through to upstream `/v1/models` |
+| `GET /health` | Returns `ok` |
+
+## Headers forwarded upstream
+
+Only these headers go to the upstream. Everything else from Codex is dropped.
+
+| Incoming header | Sent upstream as |
+|---|---|
+| `Authorization` | `Authorization` (unchanged) |
+| `User-Agent` | `User-Agent` (unchanged) |
+| `x-codex-turn-metadata` | `x-viv-meta` |
+
+To rename more headers, add pairs to `HEADER_RENAMES` in `src/main.rs`.
+
+## Reading the logs
+
+```
+INFO #3 ▶ request  [stream, model=gpt-5.6-luna, input_items=24 → messages=21, tools=6, reasoning_effort=medium]
+    tools  ▸ declared (6): shell(command, workdir, timeout_ms) [function], apply_patch(input) [custom→function], ...
+             dropped (1): web_search
+             parallel_tool_calls=false
+             in input: 5 calls (shell ×4, apply_patch ×1), 5 outputs
+INFO #3 ◀ response  [stream, 8.42s, model=gpt-5.6-luna]
+    stop   ▸ finish_reason = "tool_calls"  →  status = completed (sent response.completed)
+    usage  ▸ inp: 8,029, cd-inp: 6,144 (76.5%), opt: 212 (reasoning: 64)
+```
+
+**Request line (`▶`)**
+- `input_items → messages`: how many Responses input items became how many Chat messages.
+- `tools ▸ declared`: tools sent upstream, with parameter names and how each was converted.
+- `dropped`: tool types the proxy can't send upstream (e.g. `web_search`).
+- `in input`: tool calls and outputs replayed in the conversation history.
+- `⚠ calls without output` / `⚠ outputs without call`: the history has unpaired tool calls. Chat Completions backends often reject this. When it happens, the request line is logged as **WARN**.
+
+**Response line (`◀`)**
+- `stop`: the raw upstream `finish_reason` and the Responses status Codex was sent. If upstream also sends `stop_reason`, `native_finish_reason` or `matched_stop`, they are shown on the same line.
+- `usage`: `inp` = prompt tokens, `cd-inp` = cached prompt tokens (with hit rate), `opt` = completion tokens (with reasoning tokens). `n/a` means upstream didn't report that field.
+- `note`: any abnormal event (see below). The response line is logged as **WARN** when any note appears or `finish_reason` is not `stop` / `tool_calls`.
+
+### How `finish_reason` maps to what Codex receives
+
+| Upstream `finish_reason` | Codex receives |
+|---|---|
+| `stop`, `tool_calls` | `response.completed` |
+| `length` | `response.incomplete` (reason `max_output_tokens`) |
+| `content_filter` | `response.incomplete` (reason `content_filter`) |
+| *missing, and no `[DONE]`* | `response.failed`: `upstream stream ended without finish_reason and without [DONE]` |
+| upstream HTTP error | same HTTP status and body |
+
+Codex treats `response.incomplete` and `response.failed` as errors.
+
+Other notes that can appear: `upstream stream closed without [DONE]`, `finish_reason changed mid-stream`, `upstream sent error event`, `client disconnected before the response finished`.
+
+## Conversion details
+
+**Request (Responses → Chat Completions)**
+
+- `instructions` and `developer`/`system` messages become `system` messages.
+- `function_call` and `function_call_output` become assistant `tool_calls` and `tool` messages. Consecutive calls are merged into one assistant message.
+- `custom` tools (Codex's freeform `apply_patch`) are sent as a function with a single `input: string` parameter. The tool's grammar is appended to the description, and the reply is converted back into a `custom_tool_call`.
+- `reasoning.effort` → `reasoning_effort`, `max_output_tokens` → `max_tokens`, `text.format` (json_schema) → `response_format`.
+- `temperature`, `top_p`, `tool_choice`, `parallel_tool_calls` are passed through.
+- Streaming requests add `stream_options.include_usage = true` so usage is reported.
+
+**Response (Chat Completions → Responses)**
+
+- `content` becomes a `message` item.
+- `tool_calls` become `function_call` / `custom_tool_call` items.
+- `reasoning_content` / `reasoning` become a `reasoning` item, shown in Codex as a reasoning summary.
+- In streaming mode, the full Responses SSE event sequence is emitted (`response.created` … `output_item.added` / deltas / `output_item.done` … `response.completed`).
+
+## Limitations
+
+- Built-in tools other than `function` / `custom` (e.g. `web_search`, `local_shell`) are not sent upstream.
+- Reasoning items from earlier turns (often encrypted) can't be replayed to a Chat backend and are dropped.
+- `input_image` works with URLs and data URLs only, not `file_id`.
+- Only the first choice (`n = 1`) is used.
+
+## Project layout
+
+```
+src/
+├── main.rs      # HTTP server, routes, header forwarding, non-stream path
+├── convert.rs   # Request/response conversion between the two APIs
+├── stream.rs    # Chat Completions SSE → Responses SSE translator
+└── report.rs    # Log formatting: request/tools, stop, usage
+```
