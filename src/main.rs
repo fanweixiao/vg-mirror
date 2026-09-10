@@ -1,5 +1,6 @@
-//! Local proxy for codex: exposes OpenAI `/v1/responses`, forwards to an
-//! upstream Chat Completions endpoint, and logs finish_reason + usage.
+//! codex 用的本地 LLM API 代理：
+//! 对外暴露 OpenAI Responses 接口 `/v1/responses`，转换成 Chat Completions 请求发给上游，
+//! 并在日志里打印每次响应的 stop 值（finish_reason）和 usage。
 
 mod convert;
 mod report;
@@ -21,10 +22,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+// 默认上游和监听端口（README: Configuration）
 const DEFAULT_UPSTREAM: &str = "https://api.vivgrid.com/v1/chat/completions";
 const DEFAULT_LISTEN: &str = "127.0.0.1:33333";
 
-/// Incoming headers forwarded upstream under a new name: (incoming, upstream).
+// 需要改名后转发给上游的 header：(收到的名字, 发给上游的名字)
+// （README: Headers forwarded upstream）
 const HEADER_RENAMES: &[(&str, &str)] = &[("x-codex-turn-metadata", "x-viv-meta")];
 
 #[derive(Clone)]
@@ -32,13 +35,15 @@ struct AppState {
     client: reqwest::Client,
     upstream: String,
     models_url: String,
-    /// Used only when the incoming request carries no Authorization header.
+    // 请求没带 Authorization 时才用的备用 key（UPSTREAM_API_KEY）
     fallback_key: Option<String>,
+    // 请求编号，日志里的 #1、#2…
     counter: Arc<AtomicU64>,
 }
 
 #[tokio::main]
 async fn main() {
+    // 日志级别，默认 codex_proxy=info（RUST_LOG）
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("codex_proxy=info")),
@@ -46,6 +51,7 @@ async fn main() {
         .with_target(false)
         .init();
 
+    // 读取环境变量配置（README: Configuration）
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.into());
     let upstream = std::env::var("UPSTREAM_URL").unwrap_or_else(|_| DEFAULT_UPSTREAM.into());
     let models_url = match upstream.strip_suffix("/chat/completions") {
@@ -67,14 +73,14 @@ async fn main() {
         counter: Arc::new(AtomicU64::new(0)),
     };
 
+    // 路由（README: Endpoints）
     let app = Router::new()
         .route("/v1/responses", post(responses))
         .route("/responses", post(responses))
         .route("/v1/models", get(models))
         .route("/health", get(|| async { "ok" }))
-        .fallback(|method: axum::http::Method, uri: axum::http::Uri, _headers: HeaderMap| async move {
+        .fallback(|method: axum::http::Method, uri: axum::http::Uri| async move {
             warn!("unhandled route: {method} {uri}");
-            // warn!("  headers ({}):\n{}", _headers.len(), format_headers(&_headers));
             error_json(StatusCode::NOT_FOUND, &format!("no route for {method} {uri}"))
         })
         .with_state(state);
@@ -88,6 +94,7 @@ fn error_json(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": { "message": msg, "type": "proxy_error" } }))).into_response()
 }
 
+// 透传 Bearer Token：优先用 codex 发来的 Authorization，没有才用 UPSTREAM_API_KEY
 fn auth_header(st: &AppState, headers: &HeaderMap) -> Option<HeaderValue> {
     if let Some(v) = headers.get(header::AUTHORIZATION) {
         return Some(v.clone());
@@ -96,36 +103,81 @@ fn auth_header(st: &AppState, headers: &HeaderMap) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!("Bearer {key}")).ok()
 }
 
-/// One header per line; the Authorization token is masked to its first 6 / last 4 chars.
-/// Currently unused: the header log lines are commented out.
-#[allow(dead_code)]
-fn format_headers(headers: &HeaderMap) -> String {
-    let mut lines: Vec<String> = headers
-        .iter()
-        .map(|(name, value)| {
-            let v = String::from_utf8_lossy(value.as_bytes()).to_string();
-            let v = if name == header::AUTHORIZATION { mask_auth(&v) } else { v };
-            format!("    {name}: {v}")
-        })
-        .collect();
-    lines.sort();
-    lines.join("\n")
+// 发请求给上游：只转发 Authorization、User-Agent 和 HEADER_RENAMES 里的 header
+// （README: Headers forwarded upstream）
+async fn send_upstream(
+    st: &AppState,
+    headers: &HeaderMap,
+    auth: &HeaderValue,
+    is_stream: bool,
+    body: &Value,
+    req_id: u64,
+) -> reqwest::Result<reqwest::Response> {
+    let accept = if is_stream { "text/event-stream" } else { "application/json" };
+    let mut rb = st
+        .client
+        .post(&st.upstream)
+        .header(header::AUTHORIZATION, auth.clone())
+        .header(header::ACCEPT, accept);
+    if let Some(ua) = headers.get(header::USER_AGENT) {
+        rb = rb.header(header::USER_AGENT, ua.clone());
+    }
+    for (from, to) in HEADER_RENAMES {
+        if let Some(v) = headers.get(*from) {
+            debug!("#{req_id} forwarding header {from} → {to}");
+            rb = rb.header(*to, v.clone());
+        }
+    }
+    rb.json(body).send().await
 }
 
-#[allow(dead_code)]
-fn mask_auth(v: &str) -> String {
-    let (scheme, token) = v.split_once(' ').unwrap_or(("", v));
-    let chars: Vec<char> = token.chars().collect();
-    let masked = if chars.len() <= 12 {
-        "*".repeat(chars.len())
-    } else {
-        let head: String = chars[..6].iter().collect();
-        let tail: String = chars[chars.len() - 4..].iter().collect();
-        format!("{head}…{tail} ({} chars)", chars.len())
+fn upstream_send_failed(req_id: u64, e: reqwest::Error) -> Response {
+    error!("#{req_id} ✖ upstream request failed: {e}");
+    error_json(StatusCode::BAD_GATEWAY, &format!("upstream request failed: {e}"))
+}
+
+// 上游返回 HTTP 错误：打日志，并把原状态码和 body 原样返回给 codex
+// （README: finish_reason 映射表里的 "upstream HTTP error"）
+fn upstream_error(req_id: u64, code: StatusCode, text: String, started: Instant) -> Response {
+    error!(
+        "#{req_id} ✖ upstream HTTP {code} ({:.2}s)\n    stop   ▸ n/a (no completion)\n    body   ▸ {text}",
+        started.elapsed().as_secs_f64()
+    );
+    (code, [(header::CONTENT_TYPE, "application/json")], text).into_response()
+}
+
+// 排查用：上游报错时，打印实际发出去的请求（除 messages 外的字段 + 转发的 header），
+// 并把完整请求体存到临时文件，方便用 curl 原样重放、逐项排除
+fn dump_sent_request(st: &AppState, headers: &HeaderMap, body: &Value, req_id: u64) {
+    let mut fields = body.clone();
+    let n_messages = fields.as_object_mut().and_then(|o| o.remove("messages")).and_then(|m| m.as_array().map(Vec::len));
+    let mut sent_headers = Vec::new();
+    if let Some(ua) = headers.get(header::USER_AGENT) {
+        sent_headers.push(format!("user-agent: {}", String::from_utf8_lossy(ua.as_bytes())));
+    }
+    for (from, to) in HEADER_RENAMES {
+        if let Some(v) = headers.get(*from) {
+            sent_headers.push(format!("{to}: {}", String::from_utf8_lossy(v.as_bytes())));
+        }
+    }
+    let path = std::env::temp_dir().join(format!("codex-proxy-req-{req_id}.json"));
+    let saved = match std::fs::write(&path, serde_json::to_vec_pretty(body).unwrap_or_default()) {
+        Ok(()) => format!(
+            "{}\n             replay: curl -sS {} -H \"Authorization: Bearer $VIVGRID_API_KEY\" -H 'content-type: application/json' -d @{}",
+            path.display(),
+            st.upstream,
+            path.display()
+        ),
+        Err(e) => format!("<failed to save: {e}>"),
     };
-    if scheme.is_empty() { masked } else { format!("{scheme} {masked}") }
+    error!(
+        "#{req_id} ✖ request that was sent upstream:\n    body   ▸ {fields}  (+ {} messages)\n    header ▸ {}\n    saved  ▸ {saved}",
+        n_messages.unwrap_or(0),
+        if sent_headers.is_empty() { "-".to_string() } else { sent_headers.join("\n             ") },
+    );
 }
 
+// POST /v1/responses：Responses → Chat Completions → 上游 → 转回 Responses
 async fn responses(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let req_id = st.counter.fetch_add(1, Ordering::Relaxed) + 1;
     let started = Instant::now();
@@ -139,53 +191,41 @@ async fn responses(State(st): State<AppState>, headers: HeaderMap, body: Bytes) 
     };
     let is_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let model = req.get("model").and_then(Value::as_str).unwrap_or("").to_string();
-    let chat = convert::to_chat_request(&req, is_stream);
 
-    let n_messages = chat.body["messages"].as_array().map_or(0, Vec::len);
-    let n_tools = chat.body.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
+    // 请求格式转换（README: Conversion details → Request）
+    let chat = convert::to_chat_request(&req, is_stream);
+    let body = chat.body;
+
+    // 请求日志：概要行 + tools 信息 + input item 类型统计 + 上游 body 里的工具痕迹
+    // （README: Reading the logs → Request line）
+    let n_messages = body["messages"].as_array().map_or(0, Vec::len);
+    let n_tools = body.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
     let n_input = req.get("input").and_then(Value::as_array).map_or(1, Vec::len);
-    let effort = req.pointer("/reasoning/effort").and_then(Value::as_str).unwrap_or("-");
     let mode = if is_stream { "stream" } else { "non-stream" };
     let tools = report::tools_summary(&req, &chat.dropped_tools);
+    let items = report::input_items_summary(&req);
+    let traces = report::upstream_tool_traces(&body);
     let line = format!(
-        "#{req_id} ▶ request  [{mode}, model={model}, input_items={n_input} → messages={n_messages}, tools={n_tools}, reasoning_effort={effort}]\n{tools}"
+        "#{req_id} ▶ request  [{mode}, model={model}, input_items={n_input} → messages={n_messages}, tools={n_tools}]\n{tools}\n{items}\n{traces}"
     );
-    if tools.contains('⚠') {
+    if tools.contains('⚠') || items.contains('⚠') {
         warn!("{line}");
     } else {
         info!("{line}");
     }
-    // info!("#{req_id} headers ({}):\n{}", headers.len(), format_headers(&headers));
-    debug!("#{req_id} upstream request body: {}", chat.body);
 
     let Some(auth) = auth_header(&st, &headers) else {
         warn!("#{req_id} no Authorization header (and UPSTREAM_API_KEY unset)");
         return error_json(StatusCode::UNAUTHORIZED, "missing Authorization: Bearer <token>");
     };
+    debug!("#{req_id} upstream request body: {body}");
 
-    let accept = if is_stream { "text/event-stream" } else { "application/json" };
-    let mut rb = st
-        .client
-        .post(&st.upstream)
-        .header(header::AUTHORIZATION, auth)
-        .header(header::ACCEPT, accept);
-    if let Some(ua) = headers.get(header::USER_AGENT) {
-        rb = rb.header(header::USER_AGENT, ua.clone());
-    }
-    for (from, to) in HEADER_RENAMES {
-        if let Some(v) = headers.get(*from) {
-            debug!("#{req_id} forwarding header {from} → {to}");
-            rb = rb.header(*to, v.clone());
-        }
-    }
-    let upstream = match rb.json(&chat.body).send().await {
+    let upstream = match send_upstream(&st, &headers, &auth, is_stream, &body, req_id).await {
         Ok(r) => r,
-        Err(e) => {
-            error!("#{req_id} ✖ upstream request failed: {e}");
-            return error_json(StatusCode::BAD_GATEWAY, &format!("upstream request failed: {e}"));
-        }
+        Err(e) => return upstream_send_failed(req_id, e),
     };
 
+    // 上游报错（非 2xx，或 stream 请求却返回了 JSON）：原样返回
     let status = upstream.status();
     let content_type = upstream
         .headers()
@@ -193,17 +233,15 @@ async fn responses(State(st): State<AppState>, headers: HeaderMap, body: Bytes) 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-
     if !status.is_success() || (is_stream && content_type.starts_with("application/json")) {
         let text = upstream.text().await.unwrap_or_default();
-        error!(
-            "#{req_id} ✖ upstream HTTP {status} ({:.2}s)\n    stop   ▸ n/a (no completion)\n    body   ▸ {text}",
-            started.elapsed().as_secs_f64()
-        );
         let code = if status.is_success() { StatusCode::BAD_GATEWAY } else { status };
-        return (code, [(header::CONTENT_TYPE, "application/json")], text).into_response();
+        let resp = upstream_error(req_id, code, text, started);
+        dump_sent_request(&st, &headers, &body, req_id);
+        return resp;
     }
 
+    // stream=true：后台任务把 Chat SSE 翻译成 Responses SSE（见 stream.rs）
     if is_stream {
         let (tx, rx) = mpsc::channel(64);
         let translator = stream::Translator::new(tx, req_id, started, model, chat.custom_tools);
@@ -211,6 +249,7 @@ async fn responses(State(st): State<AppState>, headers: HeaderMap, body: Bytes) 
         return Sse::new(ReceiverStream::new(rx)).into_response();
     }
 
+    // stream=false：整体转换后返回（README: Conversion details → Response）
     let chat_resp: Value = match upstream.json().await {
         Ok(v) => v,
         Err(e) => {
@@ -228,6 +267,8 @@ async fn responses(State(st): State<AppState>, headers: HeaderMap, body: Bytes) 
     {
         notes.push(format!("upstream returned {n} choices (only choice 0 used)"));
     }
+
+    // 响应日志：stop 值 + usage（README: Reading the logs → Response line）
     report::log(&report::Report {
         req_id,
         stream: false,
@@ -236,15 +277,15 @@ async fn responses(State(st): State<AppState>, headers: HeaderMap, body: Bytes) 
         finish_reason: choice.get("finish_reason").and_then(Value::as_str),
         extra_stop: &report::extra_stop_fields(&choice),
         status: resp["status"].as_str().unwrap_or("?"),
-        usage: chat_resp.get("usage"),
+        usage: report::Usage::from_chat(chat_resp.get("usage")),
         notes: &notes,
     });
 
     Json(resp).into_response()
 }
 
+// GET /v1/models：直接透传给上游 /v1/models（README: Endpoints）
 async fn models(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    // info!("GET /v1/models\n  headers ({}):\n{}", headers.len(), format_headers(&headers));
     let mut rb = st.client.get(&st.models_url);
     if let Some(auth) = auth_header(&st, &headers) {
         rb = rb.header(header::AUTHORIZATION, auth);

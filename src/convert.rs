@@ -1,4 +1,5 @@
-//! Responses API <-> Chat Completions API conversion (non-streaming parts).
+//! Responses API <-> Chat Completions API 的格式转换（非流式部分）
+//! （README: Conversion details）
 
 use std::collections::HashSet;
 
@@ -7,9 +8,10 @@ use tracing::{debug, warn};
 
 pub struct ChatRequest {
     pub body: Value,
-    /// Names of Responses `custom` (freeform) tools, e.g. codex's `apply_patch`.
-    /// They are exposed upstream as functions taking `{"input": string}`.
+    // custom（自由文本）工具的名字，如 codex 的 apply_patch。
+    // 发给上游时包装成 {"input": string} 的 function，回来时再还原成 custom_tool_call。
     pub custom_tools: HashSet<String>,
+    // 无法发给上游的工具（如 web_search），日志里显示为 dropped
     pub dropped_tools: Vec<String>,
 }
 
@@ -25,18 +27,20 @@ pub fn now_secs() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Request: Responses -> Chat Completions
+// 请求：Responses -> Chat Completions（README: Conversion details → Request）
 // ---------------------------------------------------------------------------
 
 pub fn to_chat_request(req: &Value, stream: bool) -> ChatRequest {
     let mut messages: Vec<Value> = Vec::new();
 
+    // instructions → system 消息
     if let Some(ins) = req.get("instructions").and_then(Value::as_str)
         && !ins.is_empty()
     {
         messages.push(json!({ "role": "system", "content": ins }));
     }
 
+    // input（字符串或 item 数组）→ messages
     match req.get("input") {
         Some(Value::String(s)) => messages.push(json!({ "role": "user", "content": s })),
         Some(Value::Array(items)) => {
@@ -53,10 +57,12 @@ pub fn to_chat_request(req: &Value, stream: bool) -> ChatRequest {
     }
     body.insert("messages".into(), Value::Array(messages));
     body.insert("stream".into(), Value::Bool(stream));
+    // 流式时要求上游在最后一个 chunk 带上 usage，否则日志拿不到 usage
     if stream {
         body.insert("stream_options".into(), json!({ "include_usage": true }));
     }
 
+    // 采样参数 / max_output_tokens / reasoning.effort / text.format 的字段映射
     for key in ["temperature", "top_p", "user"] {
         if let Some(v) = req.get(key).filter(|v| !v.is_null()) {
             body.insert(key.into(), v.clone());
@@ -84,6 +90,7 @@ pub fn to_chat_request(req: &Value, stream: bool) -> ChatRequest {
         );
     }
 
+    // tools 转换：function 直接转；custom 包装成带 input 参数的 function；其他类型丢弃
     let mut custom_tools = HashSet::new();
     let mut dropped_tools = Vec::new();
     let mut tools = Vec::new();
@@ -109,6 +116,7 @@ pub fn to_chat_request(req: &Value, stream: bool) -> ChatRequest {
                 tools.push(json!({ "type": "function", "function": f }));
             }
             "custom" => {
+                // 把工具的语法定义拼进描述里，让模型知道 input 该怎么写
                 let mut desc = tool
                     .get("description")
                     .and_then(Value::as_str)
@@ -144,6 +152,7 @@ pub fn to_chat_request(req: &Value, stream: bool) -> ChatRequest {
             }),
         }
     }
+    // tool_choice / parallel_tool_calls 只在有工具时才发，否则上游可能报错
     if !tools.is_empty() {
         body.insert("tools".into(), Value::Array(tools));
         if let Some(tc) = req.get("tool_choice").filter(|v| !v.is_null()) {
@@ -161,6 +170,7 @@ pub fn to_chat_request(req: &Value, stream: bool) -> ChatRequest {
     }
 }
 
+// Responses 的 {"type":"function","name":..} → Chat 的 {"type":"function","function":{"name":..}}
 fn convert_tool_choice(tc: &Value) -> Value {
     match tc {
         Value::Object(o) if o.get("type").and_then(Value::as_str) == Some("function") => {
@@ -171,6 +181,10 @@ fn convert_tool_choice(tc: &Value) -> Value {
     }
 }
 
+// 单个 input item → Chat 消息：
+// - developer/system → system
+// - function_call / custom_tool_call → assistant 的 tool_calls
+// - *_output → tool 消息
 fn convert_input_item(item: &Value, messages: &mut Vec<Value>) {
     let ty = item
         .get("type")
@@ -206,14 +220,14 @@ fn convert_input_item(item: &Value, messages: &mut Vec<Value>) {
                 "content": tool_output_to_string(item.get("output")),
             }));
         }
-        // Reasoning items (often encrypted) cannot be replayed to a chat backend.
+        // 之前轮次的 reasoning（通常是加密的）无法回放给 Chat 接口，直接丢弃（README: Limitations）
         "reasoning" => {}
         other => debug!(item_type = other, "skipping unsupported input item"),
     }
 }
 
-/// Chat Completions requires tool_calls to live on an assistant message;
-/// merge consecutive calls (and a preceding assistant text) into one message.
+// Chat 要求 tool_calls 挂在 assistant 消息上：
+// 连续的多个调用（以及前面紧挨着的 assistant 文本）合并成一条消息
 fn push_tool_call(messages: &mut Vec<Value>, call_id: &str, name: &str, args: String) {
     let tc = json!({
         "id": call_id,
@@ -236,6 +250,7 @@ fn push_tool_call(messages: &mut Vec<Value>, call_id: &str, name: &str, args: St
     messages.push(json!({ "role": "assistant", "content": null, "tool_calls": [tc] }));
 }
 
+// 消息内容：文本片段拼成字符串；user 消息带图片时保留数组形式（图片只支持 URL / data URL）
 fn convert_message_content(content: Option<&Value>, role: &str) -> Value {
     let parts = match content {
         Some(Value::String(s)) => return json!(s),
@@ -283,6 +298,7 @@ fn convert_message_content(content: Option<&Value>, role: &str) -> Value {
     json!(text.join("\n"))
 }
 
+// 工具输出统一转成字符串，作为 tool 消息的 content
 fn tool_output_to_string(output: Option<&Value>) -> String {
     match output {
         Some(Value::String(s)) => s.clone(),
@@ -297,10 +313,11 @@ fn tool_output_to_string(output: Option<&Value>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Response: Chat Completions -> Responses
+// 响应：Chat Completions -> Responses（README: Conversion details → Response）
 // ---------------------------------------------------------------------------
 
-/// finish_reason -> (Responses status, incomplete_details.reason)
+// finish_reason → (Responses status, incomplete_details.reason)
+// （README: How finish_reason maps to what Codex receives）
 pub fn map_finish_reason(fr: Option<&str>) -> (&'static str, Option<&'static str>) {
     match fr {
         Some("length") => ("incomplete", Some("max_output_tokens")),
@@ -309,6 +326,7 @@ pub fn map_finish_reason(fr: Option<&str>) -> (&'static str, Option<&'static str
     }
 }
 
+// Chat 的 usage（prompt/completion_tokens）→ Responses 的 usage（input/output_tokens），返回给 codex
 pub fn convert_usage(u: Option<&Value>) -> Value {
     let Some(u) = u.filter(|u| u.is_object()) else {
         return Value::Null;
@@ -326,6 +344,7 @@ pub fn convert_usage(u: Option<&Value>) -> Value {
     })
 }
 
+// 以下几个函数构造 Responses 格式的对象：response 本体、message、reasoning、工具调用
 pub fn response_object(
     id: &str,
     created_at: i64,
@@ -368,7 +387,7 @@ pub fn reasoning_item(id: &str, text: &str) -> Value {
 
 pub fn tool_call_item(id: &str, call_id: &str, name: &str, args: &str, custom: bool) -> Value {
     if custom {
-        // Unwrap {"input": "..."}; fall back to the raw string if the model didn't comply.
+        // custom 工具：拆开 {"input": "..."} 还原成 custom_tool_call；模型没按格式给就用原始字符串
         let input = serde_json::from_str::<Value>(args)
             .ok()
             .and_then(|v| v.get("input")?.as_str().map(str::to_string))
@@ -393,6 +412,7 @@ pub fn tool_call_item(id: &str, call_id: &str, name: &str, args: &str, custom: b
     }
 }
 
+// 上游的思考内容：reasoning_content 或 reasoning 字段，codex 里显示为 reasoning summary
 pub fn reasoning_text(v: &Value) -> Option<&str> {
     v.get("reasoning_content")
         .or_else(|| v.get("reasoning"))
@@ -400,7 +420,7 @@ pub fn reasoning_text(v: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Convert a non-streaming chat completion into a Responses object.
+// stream=false：整个 chat completion 转成一个 Responses 对象（只用第一个 choice）
 pub fn chat_to_response(chat: &Value, resp_id: &str, fallback_model: &str, custom: &HashSet<String>) -> Value {
     let choice = chat.pointer("/choices/0").cloned().unwrap_or(Value::Null);
     let msg = choice.get("message").cloned().unwrap_or(Value::Null);

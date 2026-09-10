@@ -1,4 +1,5 @@
-//! Streaming: Chat Completions SSE chunks -> Responses API SSE events.
+//! stream=true：把上游 Chat Completions 的 SSE chunk 实时翻译成 Responses API 的 SSE 事件，
+//! 结束时打印 stop 值和 usage（README: Conversion details → Response、Reading the logs）
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -18,6 +19,7 @@ use crate::report;
 
 pub type EventTx = mpsc::Sender<Result<Event, Infallible>>;
 
+// 输出里的一个 item：文本消息 / 思考内容 / 工具调用
 enum Kind {
     Message,
     Reasoning,
@@ -32,11 +34,13 @@ enum Kind {
 struct Item {
     id: String,
     kind: Kind,
+    // 累积的增量内容（文本 / 思考 / 工具参数）
     buf: String,
-    /// Final item JSON once `response.output_item.done` has been emitted.
+    // 发出 response.output_item.done 后的最终 item，用于最后的 response 对象
     done: Option<Value>,
 }
 
+// 处理一行 SSE 后的结果：继续 / 收到 [DONE] / 上游报错
 enum Line {
     Continue,
     Done,
@@ -53,12 +57,14 @@ pub struct Translator {
     model: String,
     custom_tools: HashSet<String>,
 
+    // 输出 item 列表，以及当前正在写入的文本 / 思考 item、工具调用 index → item 的映射
     items: Vec<Item>,
     open_text: Option<usize>,
     open_reasoning: Option<usize>,
     tool_slots: HashMap<u64, usize>,
     last_tool: Option<usize>,
 
+    // 以下用于最后的日志：stop 值、usage、是否收到 [DONE]、异常 note
     finish_reason: Option<String>,
     extra_stop: Vec<(String, Value)>,
     usage: Option<Value>,
@@ -94,6 +100,7 @@ impl Translator {
         }
     }
 
+    // 主循环：先发 response.created / in_progress，再逐行读上游 SSE，最后 finish
     pub async fn run(mut self, upstream: reqwest::Response) {
         let snapshot = response_object(&self.resp_id, self.created_at, &self.model, "in_progress", None, vec![], Value::Null);
         self.emit("response.created", json!({ "response": snapshot.clone() })).await;
@@ -127,7 +134,7 @@ impl Translator {
                 }
             }
         }
-        // A final line without a trailing newline.
+        // 最后一行可能没有换行符
         if error.is_none() && !self.got_done && !self.client_gone && !buf.is_empty() {
             let rest = String::from_utf8_lossy(&buf).to_string();
             if let Line::Error(e) = self.process_line(&rest).await {
@@ -138,6 +145,7 @@ impl Translator {
         self.finish(error).await;
     }
 
+    // 解析一行 "data: ..."：[DONE] / error 事件 / 普通 chunk
     async fn process_line(&mut self, line: &str) -> Line {
         let line = line.trim_end_matches(['\r', '\n']);
         let Some(data) = line.strip_prefix("data:") else {
@@ -160,6 +168,7 @@ impl Translator {
         Line::Continue
     }
 
+    // 处理一个 chunk：记下 usage，把 delta 分发给思考 / 文本 / 工具调用，记录 finish_reason
     async fn on_chunk(&mut self, v: &Value) {
         self.chunks += 1;
         if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
@@ -187,6 +196,7 @@ impl Translator {
                     self.on_tool_delta(tc).await;
                 }
             }
+            // stop 值：记录 finish_reason；中途变化也记一条 note，方便排查
             if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
                 debug!(req = self.req_id, chunk = self.chunks, finish_reason = fr, "finish_reason received");
                 if let Some(prev) = &self.finish_reason
@@ -215,6 +225,7 @@ impl Translator {
         self.items.len() - 1
     }
 
+    // 思考内容增量 → reasoning item + reasoning_summary_text.delta 事件
     async fn on_reasoning(&mut self, delta: &str) {
         let idx = match self.open_reasoning {
             Some(i) => i,
@@ -245,6 +256,7 @@ impl Translator {
         .await;
     }
 
+    // 文本增量 → message item + output_text.delta 事件
     async fn on_text(&mut self, delta: &str) {
         let idx = match self.open_text {
             Some(i) => i,
@@ -278,6 +290,8 @@ impl Translator {
         .await;
     }
 
+    // 工具调用增量：按 index 归到同一个调用，拼接参数；
+    // function 工具发 function_call_arguments.delta，custom 工具等结束时一次性给出 input
     async fn on_tool_delta(&mut self, tc: &Value) {
         let key = tc.get("index").and_then(Value::as_u64);
         let id = tc.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
@@ -288,7 +302,7 @@ impl Translator {
             Some(k) => self.tool_slots.get(&k).copied(),
             None => self.last_tool,
         };
-        // Same slot unless upstream starts a new call id on a reused index.
+        // 同一个 index 沿用同一个调用，除非上游在这个 index 上换了新的 call id
         let slot = match existing {
             Some(i) if id.is_none_or(|id| matches!(&self.items[i].kind, Kind::Tool { call_id, .. } if call_id == id)) => i,
             _ => {
@@ -351,6 +365,7 @@ impl Translator {
         self.emit("response.output_item.added", json!({ "output_index": idx, "item": item })).await;
     }
 
+    // 以下 close_* 结束对应的 item，发出 *.done 和 output_item.done 事件
     async fn close_text(&mut self) {
         let Some(i) = self.open_text.take() else { return };
         let (id, text) = (self.items[i].id.clone(), self.items[i].buf.clone());
@@ -417,11 +432,14 @@ impl Translator {
         }
     }
 
+    // 结束：关闭所有 item，按 finish_reason 决定发 completed / incomplete / failed，
+    // 然后打印 stop + usage 日志（README: How finish_reason maps to what Codex receives）
     async fn finish(mut self, mut error: Option<String>) {
         self.close_reasoning().await;
         self.close_text().await;
         self.close_tools().await;
 
+        // 既没 finish_reason 也没 [DONE]：上游中途断了，发 response.failed
         if error.is_none() && !self.client_gone && !self.got_done && self.finish_reason.is_none() {
             error = Some("upstream stream ended without finish_reason and without [DONE]".into());
         }
@@ -462,11 +480,12 @@ impl Translator {
             finish_reason: self.finish_reason.as_deref(),
             extra_stop: &self.extra_stop,
             status: &format!("{status_str} (sent {event})"),
-            usage: self.usage.as_ref(),
+            usage: report::Usage::from_chat(self.usage.as_ref()),
             notes: &self.notes,
         });
     }
 
+    // 发一个 Responses SSE 事件给 codex（带 type 和递增的 sequence_number）
     async fn emit(&mut self, ty: &str, mut data: Value) {
         if self.client_gone {
             return;

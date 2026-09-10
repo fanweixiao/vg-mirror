@@ -29,7 +29,7 @@ Edit `~/.codex/config.toml`:
 
 ```toml
 model_provider = "local"
-model = "gpt-5.6-luna"
+model = "gpt-6-astra"
 
 [model_providers.local]
 name = "Local Proxy"
@@ -42,6 +42,44 @@ experimental_bearer_token = "<VIVGRID_API_KEY>"
 - `model` is passed through unchanged, so use any model name vivgrid accepts.
 
 Then run `codex` as usual and watch the proxy's terminal for logs.
+
+## Building a release binary for macOS (Apple Silicon)
+
+The target triple for Apple Silicon (M1/M2/M3/M4…) is `aarch64-apple-darwin`.
+
+```bash
+# 1. Add the target (already installed if you're on an Apple Silicon Mac)
+rustup target add aarch64-apple-darwin
+
+# 2. Build an optimized binary
+cargo build --release --target aarch64-apple-darwin
+
+# 3. Check the architecture
+file target/aarch64-apple-darwin/release/codex-proxy
+# → Mach-O 64-bit executable arm64
+```
+
+On an Apple Silicon Mac, a plain `cargo build --release` also produces an arm64 binary, in `target/release/`. Passing `--target` is still useful: it works from an Intel Mac too, and it keeps the output path explicit.
+
+**Optional: make it smaller and install it**
+
+```bash
+# Strip debug symbols (~8.6 MB → ~6.8 MB)
+strip target/aarch64-apple-darwin/release/codex-proxy
+
+# Put it on your PATH
+mkdir -p ~/.local/bin
+cp target/aarch64-apple-darwin/release/codex-proxy ~/.local/bin/
+codex-proxy
+```
+
+**Copying the binary to another Mac**
+
+A binary you build yourself is not quarantined. If you send it to another Mac (AirDrop, browser download, chat), Gatekeeper may block it with *"cannot be opened because the developer cannot be verified"*. On that machine, run:
+
+```bash
+xattr -d com.apple.quarantine ./codex-proxy
+```
 
 ## Configuration
 
@@ -83,11 +121,13 @@ To rename more headers, add pairs to `HEADER_RENAMES` in `src/main.rs`.
 ## Reading the logs
 
 ```
-INFO #3 ▶ request  [stream, model=gpt-5.6-luna, input_items=24 → messages=21, tools=6, reasoning_effort=medium]
+INFO #3 ▶ request  [stream, model=gpt-5.6-luna, input_items=24 → messages=21, tools=6]
     tools  ▸ declared (6): shell(command, workdir, timeout_ms) [function], apply_patch(input) [custom→function], ...
              dropped (1): web_search
              parallel_tool_calls=false
              in input: 5 calls (shell ×4, apply_patch ×1), 5 outputs
+    items  ▸ message:developer ×1, message:user ×3, reasoning ×5 [dropped], function_call ×4, custom_tool_call ×1, function_call_output ×4, custom_tool_call_output ×1
+    sent   ▸ tool traces in upstream body: field `tools`, field `parallel_tool_calls`, 3 assistant messages with tool_calls, 5 tool-role messages
 INFO #3 ◀ response  [stream, 8.42s, model=gpt-5.6-luna]
     stop   ▸ finish_reason = "tool_calls"  →  status = completed (sent response.completed)
     usage  ▸ inp: 8,029, cd-inp: 6,144 (76.5%), opt: 212 (reasoning: 64)
@@ -99,6 +139,9 @@ INFO #3 ◀ response  [stream, 8.42s, model=gpt-5.6-luna]
 - `dropped`: tool types the proxy can't send upstream (e.g. `web_search`).
 - `in input`: tool calls and outputs replayed in the conversation history.
 - `⚠ calls without output` / `⚠ outputs without call`: the history has unpaired tool calls. Chat Completions backends often reject this. When it happens, the request line is logged as **WARN**.
+- `items ▸`: every input item counted by type (messages split by role). `[dropped]` = reasoning items. `[⚠ skipped: unknown type]` = item types the proxy can't convert, which are left out of the upstream request (also logged as **WARN**).
+- `sent ▸`: whether the Chat body actually sent upstream still carries any tool traces (`tools` / `tool_choice` / `functions` fields, assistant `tool_calls`, `tool`-role messages).
+- On an upstream error, the full body sent upstream is saved to `$TMPDIR/codex-proxy-req-<id>.json`, and the log prints a `curl` command to replay it.
 
 **Response line (`◀`)**
 - `stop`: the raw upstream `finish_reason` and the Responses status Codex was sent. If upstream also sends `stop_reason`, `native_finish_reason` or `matched_stop`, they are shown on the same line.
