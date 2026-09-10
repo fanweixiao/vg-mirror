@@ -8,22 +8,35 @@ For each request, the log shows the upstream **stop value** (`finish_reason`), t
 
 ## Quick start
 
-### 1. Build
+### 1. Download and run
+
+Prebuilt binary for macOS (Apple Silicon). Download it and run it locally:
+
+```bash
+curl -L -o vg-mirror https://github.com/fanweixiao/vg-mirror/releases/download/v0.1/vg-mirror
+chmod +x vg-mirror
+xattr -d com.apple.quarantine vg-mirror 2>/dev/null   # only needed if downloaded via a browser
+./vg-mirror
+# INFO vg-mirror listening on http://127.0.0.1:33333  →  upstream https://api.vivgrid.com/v1/chat/completions
+```
+
+Keep this terminal open while you use Codex. Logs show up here.
+
+<details>
+<summary>Or build from source</summary>
 
 Requires Rust 1.88+ (edition 2024).
 
 ```bash
 cargo build --release
-```
-
-### 2. Run
-
-```bash
 ./target/release/vg-mirror
-# INFO vg-mirror listening on http://127.0.0.1:33333  →  upstream https://api.vivgrid.com/v1/chat/completions
 ```
 
-### 3. Point Codex at the proxy
+For a stripped Apple Silicon binary, see [Building a release binary for macOS](#building-a-release-binary-for-macos-apple-silicon).
+
+</details>
+
+### 2. Point Codex at the proxy
 
 Edit `~/.codex/config.toml`:
 
